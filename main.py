@@ -5,7 +5,6 @@ import random
 import matplotlib.pyplot as plt
 from PIL import Image
 from ultralytics import YOLO
-
 import math
 
 def sigmoid(x):
@@ -62,12 +61,14 @@ def depth_to_heatmap(depth_map):
     heatmap = (255 * (1 - norm_depth)).astype(np.uint8)
     return cv2.applyColorMap(heatmap, cv2.COLORMAP_INFERNO)
 
-def annotate_with_yolo(frame, yolo_results, depth_map, gamma = 2):
+def annotate_with_yolo(frame, yolo_results, depth_map, gamma=2):
     annotated = frame.copy()
+    car_info = []  # List to store (cx, cy, distance)
+
     for result in yolo_results:
         for box in result.boxes:
             cls = int(box.cls[0])
-            if cls != 2:  # Only keep 'car' class (class 2 in COCO)
+            if cls != 2:  # Only 'car' class
                 continue
 
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
@@ -79,11 +80,41 @@ def annotate_with_yolo(frame, yolo_results, depth_map, gamma = 2):
             distance *= gamma
             distance *= sigmoid(distance)
 
-            # Only show distance (no 'car' label)
+            car_info.append((cx, cy, distance))
+
             label = f"{distance:.2f}m"
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(annotated, label, (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    return annotated, car_info
+
+
+from itertools import combinations
+
+from itertools import combinations
+
+def annotate_pairwise_depth_distances(image, car_info):
+    annotated = image.copy()
+
+    # Sort cars by distance from the camera (nearest first)
+    sorted_info = sorted(car_info, key=lambda x: x[2])  # (cx, cy, distance)
+
+    for i in range(len(sorted_info) - 1):
+        x1, y1, d1 = sorted_info[i]
+        x2, y2, d2 = sorted_info[i + 1]
+
+        # Draw line from car i to car i+1 (in front of it)
+        distance_diff = np.sqrt((d1 - d2)**2 + 4)  # positive means the next car is farther
+
+        mid_x = (x1 + x2) // 2
+        mid_y = (y1 + y2) // 2
+
+        # Draw line and label
+        cv2.line(annotated, (x1, y1), (x2, y2), (255, 0, 255), 2)
+        cv2.putText(annotated, f"{distance_diff:.2f}m", (mid_x, mid_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
     return annotated
 
 
@@ -121,8 +152,10 @@ def main(video_path):
             depth_map = midas_depth(frame)
             depth_heatmap = depth_to_heatmap(depth_map)
             yolo_results = yolo(frame)
-            annotated_frame = annotate_with_yolo(frame, yolo_results, depth_map)
-            plot_results(frame, depth_heatmap, annotated_frame)
+            annotated_yolo, car_info = annotate_with_yolo(frame, yolo_results, depth_map)
+            annotated_with_3d = annotate_pairwise_depth_distances(annotated_yolo, car_info)
+            plot_results(frame, depth_heatmap, annotated_with_3d)
+
             break
         current_frame += 1
 

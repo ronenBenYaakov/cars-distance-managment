@@ -13,134 +13,10 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QTextEdit, QHBoxLayout, QSizePolicy
 )
 from PyQt6.QtCore import Qt
-
-
-# Load LLM (flan-t5-small)
-tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-small")
-llm = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-small")
-
-# Load MiDaS model and transform
-midas = torch.hub.load("intel-isl/MiDaS", "DPT_Hybrid")
-midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
-transform = midas_transforms.dpt_transform
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-midas.to(device)
-midas.eval()
-
-# Load YOLOv8
-yolo = YOLO("yolov8s.pt")
-
-
-def sigmoid(x):
-    return 1 / (1 + math.exp(-x))
-
-
-def midas_depth(frame, scratcher=3000):
-    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    img_np = np.array(img_rgb)
-    result = transform(img_np)
-    input_tensor = result["image"].to(device) if isinstance(result, dict) else result.to(device)
-    if input_tensor.dim() == 3:
-        input_tensor = input_tensor.unsqueeze(0)
-
-    with torch.no_grad():
-        prediction = midas(input_tensor)
-        if prediction.dim() == 3:
-            prediction = prediction.unsqueeze(1)
-        elif prediction.dim() == 2:
-            prediction = prediction.unsqueeze(0).unsqueeze(0)
-
-        prediction_resized = torch.nn.functional.interpolate(
-            prediction,
-            size=img_np.shape[:2],
-            mode="bicubic",
-            align_corners=False
-        )
-
-    depth_map = prediction_resized.squeeze().cpu().numpy()
-    inverted_depth = scratcher * (1 / (depth_map + 1e-6))
-    return inverted_depth
-
-
-def depth_to_heatmap(depth_map):
-    d_min, d_max = np.min(depth_map), np.max(depth_map)
-    norm_depth = (depth_map - d_min) / (d_max - d_min + 1e-8)
-    heatmap = (255 * (1 - norm_depth)).astype(np.uint8)
-    return cv2.applyColorMap(heatmap, cv2.COLORMAP_INFERNO)
-
-
-def annotate_with_yolo(frame, yolo_results, depth_map, gamma=2):
-    annotated = frame.copy()
-    car_info = []
-
-    for result in yolo_results:
-        for box in result.boxes:
-            cls = int(box.cls[0])
-            if cls not in [2, 7]:  # Only 'car' and 'truck' classes (COCO)
-                continue
-
-            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            cx = np.clip(cx, 0, depth_map.shape[1] - 1)
-            cy = np.clip(cy, 0, depth_map.shape[0] - 1)
-            distance = depth_map[cy, cx]
-            distance *= gamma * sigmoid(distance)
-            car_info.append((cx, cy, distance))
-
-            label = f"{distance:.2f}m"
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(annotated, label, (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-    return annotated, car_info
-
-
-def annotate_pairwise_depth_distances(image, car_info):
-    annotated = image.copy()
-
-    # Sort cars by distance (nearest first)
-    sorted_info = sorted(car_info, key=lambda x: x[2])  # (cx, cy, dist)
-
-    for i in range(len(sorted_info) - 1):
-        x1, y1, d1 = sorted_info[i]
-        x2, y2, d2 = sorted_info[i + 1]
-
-        # Calculate pairwise distance (Euclidean approx)
-        distance_diff = np.sqrt((d1 - d2) ** 2 + 4)  # +4 to avoid zero
-
-        mid_x = (x1 + x2) // 2
-        mid_y = (y1 + y2) // 2
-
-        # Draw line and distance label
-        cv2.line(annotated, (x1, y1), (x2, y2), (255, 0, 255), 2)
-        cv2.putText(annotated, f"{distance_diff:.2f}m", (mid_x, mid_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-
-    return annotated
-
-
-def generate_summary_llm(car_info):
-    if not car_info:
-        return "No vehicles detected."
-
-    sorted_info = sorted(enumerate(car_info, start=1), key=lambda x: x[1][2])
-    prompt_lines = []
-
-    for i, (idx, (cx, cy, dist)) in enumerate(sorted_info):
-        prompt_lines.append(f"Vehicle {idx} is at ({cx},{cy}) approximately {dist:.1f} meters away.")
-
-    for i in range(len(sorted_info) - 1):
-        idx1, (_, _, d1) = sorted_info[i]
-        idx2, (_, _, d2) = sorted_info[i + 1]
-        spacing = np.sqrt((d1 - d2)**2 + 4)
-        prompt_lines.append(f"Vehicle {idx1} and {idx2} are {spacing:.1f} meters apart.")
-
-    full_prompt = "Summarize this traffic scene:\n" + "\n".join(prompt_lines)
-    inputs = tokenizer("Summarize: " + full_prompt, return_tensors="pt", truncation=True)
-    outputs = llm.generate(**inputs, max_new_tokens=100)
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
-
+from depth_utils import midas, midas_depth, depth_to_heatmap
+from yolo import annotate_pairwise_depth_distances, annotate_with_yolo, yolo
+from llm import generate_summary_llm
+from road import random_frame_predictions, model
 
 def plot_results(frame, depth_heatmap, yolo_annotated):
     fig, axs = plt.subplots(1, 3, figsize=(18, 6))
@@ -220,30 +96,53 @@ class VideoAnalyzerApp(QWidget):
             return "Video has no frames or cannot be read."
 
         selected_frame_idx = random.randint(0, frame_count - 1)
-
         current_frame = 0
         summary = "No vehicles detected."
+
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
             if current_frame == selected_frame_idx:
+                # Step 1: Depth Estimation
                 depth_map = midas_depth(frame)
                 depth_heatmap = depth_to_heatmap(depth_map)
+
+                # Step 2: YOLOv8 detections & car analysis
                 yolo_results = yolo(frame)
                 annotated_yolo, car_info = annotate_with_yolo(frame, yolo_results, depth_map)
-
-                # Add pairwise distance lines & labels
                 annotated_yolo = annotate_pairwise_depth_distances(annotated_yolo, car_info)
 
-                plot_results(frame, depth_heatmap, annotated_yolo)
+                # Step 3: Road segmentation (overlay mask)
+                try:
+                    road_result = random_frame_predictions(video_path=video_path, model=model)
+                    road_mask = road_result.get('mask')
 
+                    if road_mask is not None:
+                        dark_purple = (80, 0, 80)
+                        mask_bool = road_mask.astype(bool)
+                        overlay = annotated_yolo.copy()
+                        overlay[mask_bool] = dark_purple
+                        combined_frame = cv2.addWeighted(annotated_yolo, 0.7, overlay, 0.3, 0)
+                    else:
+                        print("[WARN] No 'mask' returned from road prediction.")
+                        combined_frame = annotated_yolo
+                except Exception as e:
+                    print(f"[ERROR] Failed to apply road mask: {e}")
+                    combined_frame = annotated_yolo
+
+                # Step 4: Visualization
+                plot_results(frame, depth_heatmap, combined_frame)
+
+                # Step 5: Natural language summary
                 summary = generate_summary_llm(car_info)
                 break
+
             current_frame += 1
 
         cap.release()
         return summary
+
 
 
 if __name__ == "__main__":
